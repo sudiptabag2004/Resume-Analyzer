@@ -1,791 +1,983 @@
-# Developed by dnoobnerd [https://dnoobnerd.netlify.app]    Made with Streamlit
+# AI-Powered Resume Analyzer with ML Models
+# Enhanced version with spaCy NER and sklearn classification
 
-
-###### Packages Used ######
-import streamlit as st # core package used in this project
+import streamlit as st
 import pandas as pd
-import base64, random
-import time,datetime
-import pymysql
-import os
-import socket
-import platform
-import geocoder
-import secrets
-import io,random
-import plotly.express as px # to create visualisations at the admin session
-import plotly.graph_objects as go
-from geopy.geocoders import Nominatim
-# libraries used to parse the pdf files
-from pyresparser import ResumeParser
-from pdfminer3.layout import LAParams, LTTextBox
-from pdfminer3.pdfpage import PDFPage
-from pdfminer3.pdfinterp import PDFResourceManager
-from pdfminer3.pdfinterp import PDFPageInterpreter
-from pdfminer3.converter import TextConverter
+import random
+import time
+import io
+import re
 from streamlit_tags import st_tags
 from PIL import Image
+
+# ML Libraries
+import spacy
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# PDF parsing libraries
+from pdfminer.high_level import extract_text
+from pdfminer.layout import LAParams
+from pdfminer.pdfpage import PDFPage
+from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+from pdfminer.converter import TextConverter
+from io import StringIO
+
 # pre stored data for prediction purposes
-from Courses import ds_course,web_course,android_course,ios_course,uiux_course,resume_videos,interview_videos
+from Courses import ds_course, web_course, android_course, ios_course, uiux_course, resume_videos, interview_videos
+
 import nltk
 nltk.download('stopwords')
 
+# Load spaCy model
+@st.cache_resource
+def load_spacy_model():
+    try:
+        nlp = spacy.load('en_core_web_sm')
+        return nlp
+    except:
+        st.warning("Installing spaCy model... This will only happen once.")
+        import os
+        os.system('python -m spacy download en_core_web_sm')
+        nlp = spacy.load('en_core_web_sm')
+        return nlp
 
-###### Preprocessing functions ######
+nlp = load_spacy_model()
 
 
-# Generates a link allowing the data in a given panda dataframe to be downloaded in csv format 
-def get_csv_download_link(df,filename,text):
-    csv = df.to_csv(index=False)
-    ## bytes conversions
-    b64 = base64.b64encode(csv.encode()).decode()      
-    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">{text}</a>'
-    return href
+###### ML-Enhanced Functions ######
 
-
-# Reads Pdf file and check_extractable
 def pdf_reader(file):
+    """Reads PDF file and extracts text"""
     resource_manager = PDFResourceManager()
     fake_file_handle = io.StringIO()
     converter = TextConverter(resource_manager, fake_file_handle, laparams=LAParams())
     page_interpreter = PDFPageInterpreter(resource_manager, converter)
+    
     with open(file, 'rb') as fh:
-        for page in PDFPage.get_pages(fh,
-                                      caching=True,
-                                      check_extractable=True):
+        for page in PDFPage.get_pages(fh, caching=True, check_extractable=True):
             page_interpreter.process_page(page)
-            print(page)
         text = fake_file_handle.getvalue()
 
-    ## close open handles
     converter.close()
     fake_file_handle.close()
     return text
 
 
-# show uploaded file path to view pdf_display
-def show_pdf(file_path):
-    with open(file_path, "rb") as f:
-        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-    pdf_display = F'<iframe src="data:application/pdf;base64,{base64_pdf}" width="700" height="1000" type="application/pdf"></iframe>'
-    st.markdown(pdf_display, unsafe_allow_html=True)
+def extract_name_from_pdf_by_fontsize(file):
+    """Extract name by finding the largest font size text in the PDF"""
+    try:
+        from pdfminer.layout import LAParams, LTTextBox, LTTextLine, LTChar
+        from pdfminer.pdfpage import PDFPage
+        from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+        from pdfminer.converter import PDFPageAggregator
+        
+        resource_manager = PDFResourceManager()
+        laparams = LAParams()
+        device = PDFPageAggregator(resource_manager, laparams=laparams)
+        interpreter = PDFPageInterpreter(resource_manager, device)
+        
+        text_with_sizes = []
+        
+        with open(file, 'rb') as fh:
+            # Only process first page where name usually appears
+            for page_num, page in enumerate(PDFPage.get_pages(fh)):
+                if page_num > 0:  # Only check first page
+                    break
+                    
+                interpreter.process_page(page)
+                layout = device.get_result()
+                
+                for element in layout:
+                    if isinstance(element, (LTTextBox, LTTextLine)):
+                        for text_line in element:
+                            if hasattr(text_line, '__iter__'):
+                                for character in text_line:
+                                    if isinstance(character, LTChar):
+                                        text_with_sizes.append({
+                                            'text': element.get_text().strip(),
+                                            'size': character.height,
+                                            'y_position': character.y0
+                                        })
+                                        break  # Only need one char to get size
+                                break
+        
+        if text_with_sizes:
+            # Sort by font size (descending) and y-position (top first)
+            text_with_sizes.sort(key=lambda x: (x['size'], x['y_position']), reverse=True)
+            
+            # Get top candidates with largest font
+            max_size = text_with_sizes[0]['size']
+            candidates = [item for item in text_with_sizes if item['size'] >= max_size * 0.9]
+            
+            # Filter candidates to find the most likely name
+            for candidate in candidates[:5]:  # Check top 5 largest text items
+                text = candidate['text']
+                words = text.split()
+                text_lower = text.lower()
+                
+                # Check if it looks like a name
+                if (2 <= len(words) <= 4 and
+                    3 < len(text) < 50 and
+                    not '@' in text and
+                    not any(word.lower() in ['resume', 'cv', 'curriculum', 'phone', 'email', 'address'] for word in words)):
+                    
+                    # Clean up the text - remove special characters and extra parts
+                    cleaned_text = re.split(r'[§|•·:\t]', text)[0].strip()
+                    cleaned_words = cleaned_text.split()
+                    
+                    # Validate cleaned text
+                    if (2 <= len(cleaned_words) <= 4 and
+                        not any(char.isdigit() for char in cleaned_text)):
+                        return cleaned_text
+        
+        return None
+        
+    except Exception as e:
+        return None
 
 
-# course recommendations which has data already loaded from Courses.py
+def extract_entities_with_spacy(text):
+    """Extract entities using spaCy NER (Named Entity Recognition)"""
+    doc = nlp(text)
+    
+    entities = {
+        'persons': [],
+        'organizations': [],
+        'locations': [],
+        'dates': []
+    }
+    
+    for ent in doc.ents:
+        if ent.label_ == 'PERSON':
+            entities['persons'].append(ent.text)
+        elif ent.label_ == 'ORG':
+            entities['organizations'].append(ent.text)
+        elif ent.label_ in ['GPE', 'LOC']:
+            entities['locations'].append(ent.text)
+        elif ent.label_ == 'DATE':
+            entities['dates'].append(ent.text)
+    
+    return entities
+
+
+def extract_skills_ml(text):
+    """Extract skills using ML-based approach with expanded skill database"""
+    # Comprehensive skill database
+    skill_database = {
+        'python', 'java', 'javascript', 'typescript', 'c++', 'c#', 'php', 'ruby', 'swift', 'kotlin', 'golang', 'rust', 'scala',
+        'react', 'angular', 'vue', 'svelte', 'node', 'nodejs', 'django', 'flask', 'fastapi', 'spring', 'express', 'nextjs', 'nuxt',
+        'html', 'css', 'sass', 'scss', 'tailwind', 'bootstrap', 'material ui', 'mui',
+        'sql', 'mysql', 'postgresql', 'mongodb', 'redis', 'elasticsearch', 'cassandra', 'dynamodb', 'oracle', 'sqlite',
+        'aws', 'azure', 'gcp', 'google cloud', 'docker', 'kubernetes', 'jenkins', 'terraform', 'ansible',
+        'git', 'github', 'gitlab', 'bitbucket', 'agile', 'scrum', 'jira', 'confluence',
+        'machine learning', 'deep learning', 'neural networks', 'tensorflow', 'keras', 'pytorch', 'scikit-learn', 'opencv',
+        'data analysis', 'data science', 'data visualization', 'pandas', 'numpy', 'matplotlib', 'seaborn', 'plotly',
+        'nlp', 'natural language processing', 'computer vision', 'reinforcement learning',
+        'android', 'ios', 'flutter', 'react native', 'xamarin', 'swift ui', 'jetpack compose',
+        'figma', 'adobe xd', 'sketch', 'photoshop', 'illustrator', 'after effects', 'premier pro',
+        'excel', 'powerpoint', 'word', 'tableau', 'power bi', 'looker',
+        'rest api', 'graphql', 'microservices', 'serverless', 'websockets',
+        'testing', 'unit testing', 'pytest', 'jest', 'selenium', 'cypress',
+        'linux', 'unix', 'bash', 'shell scripting', 'powershell'
+    }
+    
+    text_lower = text.lower()
+    doc = nlp(text_lower)
+    
+    # Extract skills using both keyword matching and noun phrases
+    found_skills = set()
+    
+    # Keyword matching
+    for skill in skill_database:
+        if skill in text_lower:
+            found_skills.add(skill.title())
+    
+    # Extract technical noun phrases (potential skills)
+    for chunk in doc.noun_chunks:
+        chunk_text = chunk.text.lower()
+        if chunk_text in skill_database:
+            found_skills.add(chunk_text.title())
+    
+    return list(found_skills)
+
+
+def detect_ai_generated_content(text):
+    """Detect if resume content is AI-generated using multiple ML-based indicators"""
+    
+    doc = nlp(text)
+    
+    # Initialize scores
+    ai_indicators = {
+        'repetitive_patterns': 0,
+        'perfect_grammar': 0,
+        'generic_phrases': 0,
+        'sentence_uniformity': 0,
+        'buzzword_density': 0
+    }
+    
+    # 1. Check for AI-common phrases and patterns
+    ai_phrases = [
+        'results-oriented professional', 'proven track record', 'dynamic individual',
+        'team player', 'detail-oriented', 'self-motivated', 'fast-paced environment',
+        'excellent communication skills', 'think outside the box', 'go above and beyond',
+        'synergy', 'leverage', 'spearheaded', 'orchestrated', 'championed',
+        'robust', 'cutting-edge', 'state-of-the-art', 'innovative solutions',
+        'passionate about', 'dedicated professional', 'highly motivated'
+    ]
+    
+    text_lower = text.lower()
+    generic_count = sum(1 for phrase in ai_phrases if phrase in text_lower)
+    ai_indicators['generic_phrases'] = min(generic_count / 5, 1.0)  # Normalize to 0-1
+    
+    # 2. Check sentence length uniformity (AI tends to generate uniform sentences)
+    sentences = [sent.text for sent in doc.sents if len(sent.text.split()) > 3]
+    if len(sentences) > 5:
+        sentence_lengths = [len(sent.split()) for sent in sentences]
+        avg_length = sum(sentence_lengths) / len(sentence_lengths)
+        variance = sum((x - avg_length) ** 2 for x in sentence_lengths) / len(sentence_lengths)
+        # Low variance indicates uniform sentence lengths (AI characteristic)
+        if variance < 20:
+            ai_indicators['sentence_uniformity'] = 0.8
+        elif variance < 40:
+            ai_indicators['sentence_uniformity'] = 0.5
+        else:
+            ai_indicators['sentence_uniformity'] = 0.2
+    
+    # 3. Check for repetitive sentence structures
+    sentence_starts = [sent.text.split()[0].lower() for sent in doc.sents if len(sent.text.split()) > 0]
+    if len(sentence_starts) > 0:
+        unique_starts = len(set(sentence_starts))
+        repetition_ratio = 1 - (unique_starts / len(sentence_starts))
+        ai_indicators['repetitive_patterns'] = repetition_ratio
+    
+    # 4. Check buzzword density (AI loves buzzwords)
+    buzzwords = [
+        'innovative', 'strategic', 'dynamic', 'synergy', 'leverage', 'optimize',
+        'streamline', 'enhance', 'facilitate', 'implement', 'execute', 'deliver',
+        'drive', 'transform', 'revolutionize', 'cutting-edge', 'scalable'
+    ]
+    
+    words = text_lower.split()
+    if len(words) > 0:
+        buzzword_count = sum(1 for word in words if word in buzzwords)
+        ai_indicators['buzzword_density'] = min((buzzword_count / len(words)) * 100, 1.0)
+    
+    # 5. Check for perfect grammar and structure (somewhat indicative)
+    # Count sentences without common human errors
+    total_sentences = len(list(doc.sents))
+    if total_sentences > 0:
+        # Simple heuristic: AI text tends to have consistent punctuation and capitalization
+        proper_sentences = sum(1 for sent in doc.sents if sent.text[0].isupper() and sent.text.strip()[-1] in '.!?')
+        ai_indicators['perfect_grammar'] = proper_sentences / total_sentences
+    
+    # Calculate overall AI probability
+    weights = {
+        'repetitive_patterns': 0.25,
+        'perfect_grammar': 0.15,
+        'generic_phrases': 0.30,
+        'sentence_uniformity': 0.20,
+        'buzzword_density': 0.10
+    }
+    
+    ai_probability = sum(ai_indicators[key] * weights[key] for key in ai_indicators)
+    
+    return ai_probability, ai_indicators
+
+
+def predict_career_field_ml(text, skills):
+    """Predict career field using TF-IDF and cosine similarity"""
+    
+    # Define career field patterns with more keywords
+    field_patterns = {
+        'Data Science': [
+            'machine learning', 'deep learning', 'data science', 'tensorflow', 'keras', 'pytorch',
+            'pandas', 'numpy', 'scikit-learn', 'data analysis', 'statistics', 'neural networks',
+            'predictive modeling', 'data mining', 'big data', 'hadoop', 'spark', 'nlp', 'computer vision'
+        ],
+        'Web Development': [
+            'html', 'css', 'javascript', 'react', 'angular', 'vue', 'node', 'django', 'flask',
+            'php', 'laravel', 'wordpress', 'web development', 'frontend', 'backend', 'full stack',
+            'rest api', 'graphql', 'express', 'nextjs', 'typescript'
+        ],
+        'Mobile Development': [
+            'android', 'ios', 'flutter', 'react native', 'swift', 'kotlin', 'java', 'mobile app',
+            'xamarin', 'mobile development', 'app development', 'swift ui', 'jetpack compose'
+        ],
+        'UI/UX Design': [
+            'ui', 'ux', 'user experience', 'user interface', 'figma', 'adobe xd', 'sketch',
+            'wireframe', 'prototype', 'design', 'photoshop', 'illustrator', 'user research',
+            'interaction design', 'visual design'
+        ],
+        'DevOps': [
+            'docker', 'kubernetes', 'jenkins', 'ci/cd', 'aws', 'azure', 'gcp', 'terraform',
+            'ansible', 'devops', 'cloud', 'infrastructure', 'monitoring', 'deployment'
+        ],
+        'Data Engineering': [
+            'etl', 'data pipeline', 'airflow', 'kafka', 'spark', 'hadoop', 'data warehouse',
+            'sql', 'nosql', 'data engineering', 'big data', 'data lake'
+        ]
+    }
+    
+    # Prepare documents for TF-IDF
+    documents = []
+    field_names = []
+    
+    for field, keywords in field_patterns.items():
+        documents.append(' '.join(keywords))
+        field_names.append(field)
+    
+    # Add resume text
+    resume_text = text.lower() + ' ' + ' '.join([s.lower() for s in skills])
+    documents.append(resume_text)
+    
+    # Calculate TF-IDF
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(documents)
+    
+    # Calculate cosine similarity
+    resume_vector = tfidf_matrix[-1]
+    field_vectors = tfidf_matrix[:-1]
+    
+    similarities = cosine_similarity(resume_vector, field_vectors)[0]
+    
+    # Get the best matching field
+    best_match_idx = np.argmax(similarities)
+    confidence = similarities[best_match_idx]
+    
+    if confidence > 0.1:  # Threshold for confidence
+        return field_names[best_match_idx], confidence
+    else:
+        return 'General', confidence
+
+
+def extract_resume_info_ml(text):
+    """Extract resume information using ML models"""
+    resume_data = {
+        'name': 'User',
+        'email': '',
+        'mobile_number': '',
+        'skills': [],
+        'degree': '',
+        'no_of_pages': 1,
+        'organizations': [],
+        'locations': []
+    }
+    
+    # Extract entities using spaCy NER
+    entities = extract_entities_with_spacy(text)
+    
+    # Comprehensive list of Indian states and major cities to filter out
+    indian_locations = {
+        'andhra pradesh', 'arunachal pradesh', 'assam', 'bihar', 'chhattisgarh', 'goa', 'gujarat',
+        'haryana', 'himachal pradesh', 'jharkhand', 'karnataka', 'kerala', 'madhya pradesh',
+        'maharashtra', 'manipur', 'meghalaya', 'mizoram', 'nagaland', 'odisha', 'punjab',
+        'rajasthan', 'sikkim', 'tamil nadu', 'telangana', 'tripura', 'uttar pradesh', 'uttarakhand',
+        'west bengal', 'delhi', 'mumbai', 'bangalore', 'hyderabad', 'chennai', 'kolkata', 'pune',
+        'ahmedabad', 'jaipur', 'surat', 'lucknow', 'kanpur', 'nagpur', 'indore', 'bhopal', 'visakhapatnam',
+        'andhra', 'pradesh', 'tamil', 'nadu', 'west', 'bengal', 'himachal', 'madhya', 'uttar', 'arunachal'
+    }
+    
+    # Common location indicators to filter out
+    location_indicators = {
+        'city', 'state', 'country', 'street', 'avenue', 'road', 'pin', 'pincode', 
+        'zip', 'postal', 'india', 'usa', 'uk', 'district', 'town', 'village'
+    }
+    
+    # Get all location keywords in lowercase
+    location_keywords = set([loc.lower() for loc in entities['locations']])
+    location_keywords.update(indian_locations)
+    
+    # Try to find valid person name from spaCy entities
+    
+    
+    # Extract organizations and locations
+    resume_data['organizations'] = list(set(entities['organizations']))[:5]
+    resume_data['locations'] = list(set(entities['locations']))[:3]
+    
+    # Post-process name: Clean up any remaining separators or unwanted text
+    if resume_data['name'] != 'User':
+        # Split by separators and take first valid part
+        name_parts = re.split(r'[§|•·:\t]', resume_data['name'])
+        for part in name_parts:
+            part = part.strip()
+            words = part.split()
+            # Take the part that looks like a proper name (2-3 words, all capitalized)
+            if (2 <= len(words) <= 3 and 
+                all(word[0].isupper() for word in words) and 
+                not any(char.isdigit() for char in part)):
+                resume_data['name'] = part
+                break
+    
+    # Extract email
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails = re.findall(email_pattern, text)
+    if emails:
+        resume_data['email'] = emails[0]
+    
+    # Extract phone number with improved pattern and multiple attempts
+    phone_patterns = [
+        r'\+?\d[\d\s\-\(\)]{8,}\d',  # General pattern
+        r'(?:\+91[\-\s]?)?[6789]\d{9}',  # Indian mobile pattern
+        r'\b\d{10}\b',  # Simple 10-digit pattern
+        r'\b\d{3}[\-\s]?\d{3}[\-\s]?\d{4}\b'  # US format
+    ]
+    
+    phone_found = False
+    for pattern in phone_patterns:
+        phones = re.findall(pattern, text)
+        if phones:
+            for phone in phones:
+                # Clean the phone number - keep only digits
+                cleaned_phone = re.sub(r'[^\d]', '', phone)
+                
+                # Validate: should be 10-12 digits (10 for local, 12 for +91)
+                if 10 <= len(cleaned_phone) <= 12:
+                    # If it's 12 digits and starts with 91, remove country code
+                    if len(cleaned_phone) == 12 and cleaned_phone.startswith('91'):
+                        cleaned_phone = cleaned_phone[2:]
+                    # If it's 11 digits and starts with 91, remove country code
+                    elif len(cleaned_phone) == 11 and cleaned_phone.startswith('91'):
+                        cleaned_phone = cleaned_phone[2:]
+                    
+                    # Final validation: 10 digits starting with 6, 7, 8, or 9 (Indian mobile)
+                    if len(cleaned_phone) == 10 and cleaned_phone[0] in '6789':
+                        resume_data['mobile_number'] = cleaned_phone
+                        phone_found = True
+                        break
+                    # Or any 10-digit number
+                    elif len(cleaned_phone) == 10:
+                        resume_data['mobile_number'] = cleaned_phone
+                        phone_found = True
+                        break
+        
+        if phone_found:
+            break
+    
+    # Extract skills using ML
+    resume_data['skills'] = extract_skills_ml(text)
+    
+    # Extract degree keywords
+    degree_keywords = ['bachelor', 'master', 'phd', 'b.tech', 'm.tech', 'bsc', 'msc', 'ba', 'ma', 'mba', 'bba', 'b.e', 'm.e']
+    text_lower = text.lower()
+    for keyword in degree_keywords:
+        if keyword in text_lower:
+            resume_data['degree'] = keyword.upper()
+            break
+    
+    # Count pages
+    resume_data['no_of_pages'] = max(1, text.count('\f') + 1)
+    
+    return resume_data
+
+
 def course_recommender(course_list):
-    st.subheader("**Courses & Certificates Recommendations 👨‍🎓**")
+    """Recommend courses based on field"""
+    st.subheader("**📚 Courses & Certificates Recommendations**")
     c = 0
     rec_course = []
-    ## slider to choose from range 1-10
     no_of_reco = st.slider('Choose Number of Course Recommendations:', 1, 10, 5)
     random.shuffle(course_list)
     for c_name, c_link in course_list:
         c += 1
-        st.markdown(f"({c}) [{c_name}]({c_link})")
+        st.markdown(f"**{c}.** [{c_name}]({c_link})")
         rec_course.append(c_name)
         if c == no_of_reco:
             break
     return rec_course
 
 
-###### Database Stuffs ######
-
-
-# sql connector
-connection = pymysql.connect(host='localhost',user='root',password='root@MySQL4admin',db='cv')
-cursor = connection.cursor()
-
-
-# inserting miscellaneous data, fetched results, prediction and recommendation into user_data table
-def insert_data(sec_token,ip_add,host_name,dev_user,os_name_ver,latlong,city,state,country,act_name,act_mail,act_mob,name,email,res_score,timestamp,no_of_pages,reco_field,cand_level,skills,recommended_skills,courses,pdf_name):
-    DB_table_name = 'user_data'
-    insert_sql = "insert into " + DB_table_name + """
-    values (0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
-    rec_values = (str(sec_token),str(ip_add),host_name,dev_user,os_name_ver,str(latlong),city,state,country,act_name,act_mail,act_mob,name,email,str(res_score),timestamp,str(no_of_pages),reco_field,cand_level,skills,recommended_skills,courses,pdf_name)
-    cursor.execute(insert_sql, rec_values)
-    connection.commit()
-
-
-# inserting feedback data into user_feedback table
-def insertf_data(feed_name,feed_email,feed_score,comments,Timestamp):
-    DBf_table_name = 'user_feedback'
-    insertfeed_sql = "insert into " + DBf_table_name + """
-    values (0,%s,%s,%s,%s,%s)"""
-    rec_values = (feed_name, feed_email, feed_score, comments, Timestamp)
-    cursor.execute(insertfeed_sql, rec_values)
-    connection.commit()
-
-
-###### Setting Page Configuration (favicon, Logo, Title) ######
-
+###### Streamlit Configuration ######
 
 st.set_page_config(
    page_title="AI Resume Analyzer",
-   page_icon='./Logo/recommend.png',
+   page_icon='🤖',
+   layout="wide"
 )
 
+# Custom CSS
+st.markdown("""
+<style>
+    .main {
+        padding: 2rem;
+    }
+    
+    .main-title {
+        text-align: center;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        font-size: 4rem;
+        font-weight: 900;
+        margin: 2rem 0;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    .subtitle {
+        text-align: center;
+        color: #666;
+        font-size: 1.2rem;
+        margin-bottom: 3rem;
+        font-weight: 300;
+    }
+    
+    .info-box {
+        background-color: #f8f9fa;
+        padding: 1.5rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        border-left: 5px solid #4CAF50;
+        color: #2c3e50;
+        font-size: 1.1rem;
+        line-height: 1.8;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    .success-item {
+        background-color: #d4edda;
+        color: #155724;
+        padding: 0.75rem 1rem;
+        border-radius: 5px;
+        margin: 0.5rem 0;
+        border-left: 4px solid #28a745;
+        font-size: 1rem;
+    }
+    
+    .warning-item {
+        background-color: #fff3cd;
+        color: #856404;
+        padding: 0.75rem 1rem;
+        border-radius: 5px;
+        margin: 0.5rem 0;
+        border-left: 4px solid #ffc107;
+        font-size: 1rem;
+    }
+    
+    .ml-badge {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 0.3rem 0.8rem;
+        border-radius: 15px;
+        font-size: 0.8rem;
+        font-weight: bold;
+        display: inline-block;
+        margin-left: 0.5rem;
+    }
+    
+    .level-badge {
+        display: inline-block;
+        padding: 0.5rem 1.5rem;
+        border-radius: 25px;
+        font-weight: bold;
+        font-size: 1.2rem;
+        margin: 1rem 0;
+    }
+    
+    .level-fresher {
+        background-color: #d73b5c;
+        color: white;
+    }
+    
+    .level-intermediate {
+        background-color: #1ed760;
+        color: white;
+    }
+    
+    .level-experienced {
+        background-color: #fba171;
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-###### Main function run() ######
 
+###### Main Application ######
 
 def run():
     
-    # (Logo, Heading, Sidebar etc)
-    img = Image.open('./Logo/RESUM.png')
-    st.image(img)
-    st.sidebar.markdown("# Choose Something...")
-    activities = ["User", "Feedback", "About", "Admin"]
-    choice = st.sidebar.selectbox("Choose among the given options:", activities)
-    link = '<b>Built with 🤍 by <a href="https://dnoobnerd.netlify.app/" style="text-decoration: none; color: #021659;">Deepak Padhi</a></b>' 
-    st.sidebar.markdown(link, unsafe_allow_html=True)
-    st.sidebar.markdown('''
-        <!-- site visitors -->
-
-        <div id="sfct2xghr8ak6lfqt3kgru233378jya38dy" hidden></div>
-
-        <noscript>
-            <a href="https://www.freecounterstat.com" title="hit counter">
-                <img src="https://counter9.stat.ovh/private/freecounterstat.php?c=t2xghr8ak6lfqt3kgru233378jya38dy" border="0" title="hit counter" alt="hit counter"> -->
-            </a>
-        </noscript>
+    # Main Title with Gradient
+    st.markdown('<h1 class="main-title">🤖 AI Resume Analyzer</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="subtitle">Powered by Machine Learning & Natural Language Processing</p>', unsafe_allow_html=True)
     
-        <p>Visitors <img src="https://counter9.stat.ovh/private/freecounterstat.php?c=t2xghr8ak6lfqt3kgru233378jya38dy" title="Free Counter" Alt="web counter" width="60px"  border="0" /></p>
+    st.sidebar.markdown("# 📋 About")
+    st.sidebar.info("""
+    **AI Resume Analyzer**
     
-    ''', unsafe_allow_html=True)
-
-    ###### Creating Database and Table ######
-
-
-    # Create the DB
-    db_sql = """CREATE DATABASE IF NOT EXISTS CV;"""
-    cursor.execute(db_sql)
-
-
-    # Create table user_data and user_feedback
-    DB_table_name = 'user_data'
-    table_sql = "CREATE TABLE IF NOT EXISTS " + DB_table_name + """
-                    (ID INT NOT NULL AUTO_INCREMENT,
-                    sec_token varchar(20) NOT NULL,
-                    ip_add varchar(50) NULL,
-                    host_name varchar(50) NULL,
-                    dev_user varchar(50) NULL,
-                    os_name_ver varchar(50) NULL,
-                    latlong varchar(50) NULL,
-                    city varchar(50) NULL,
-                    state varchar(50) NULL,
-                    country varchar(50) NULL,
-                    act_name varchar(50) NOT NULL,
-                    act_mail varchar(50) NOT NULL,
-                    act_mob varchar(20) NOT NULL,
-                    Name varchar(500) NOT NULL,
-                    Email_ID VARCHAR(500) NOT NULL,
-                    resume_score VARCHAR(8) NOT NULL,
-                    Timestamp VARCHAR(50) NOT NULL,
-                    Page_no VARCHAR(5) NOT NULL,
-                    Predicted_Field BLOB NOT NULL,
-                    User_level BLOB NOT NULL,
-                    Actual_skills BLOB NOT NULL,
-                    Recommended_skills BLOB NOT NULL,
-                    Recommended_courses BLOB NOT NULL,
-                    pdf_name varchar(50) NOT NULL,
-                    PRIMARY KEY (ID)
-                    );
-                """
-    cursor.execute(table_sql)
-
-
-    DBf_table_name = 'user_feedback'
-    tablef_sql = "CREATE TABLE IF NOT EXISTS " + DBf_table_name + """
-                    (ID INT NOT NULL AUTO_INCREMENT,
-                        feed_name varchar(50) NOT NULL,
-                        feed_email VARCHAR(50) NOT NULL,
-                        feed_score VARCHAR(5) NOT NULL,
-                        comments VARCHAR(100) NULL,
-                        Timestamp VARCHAR(50) NOT NULL,
-                        PRIMARY KEY (ID)
-                    );
-                """
-    cursor.execute(tablef_sql)
-
-
-    ###### CODE FOR CLIENT SIDE (USER) ######
-
-    if choice == 'User':
+    🤖 **ML Models Used:**
+    - spaCy NER (Named Entity Recognition)
+    - TF-IDF Vectorization
+    - Cosine Similarity Classification
+    
+    **Features:**
+    - ✅ Smart Resume Analysis
+    - 💡 AI Skill Extraction
+    - 📚 Course Suggestions
+    - 📊 Resume Score
+    - 🎯 Career Field Prediction
+    
+    Built with Machine Learning
+    """)
+    
+    # Main Content
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # File upload
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        pdf_file = st.file_uploader("Choose your Resume (PDF format)", type=["pdf"])
+    
+    if pdf_file is not None:
+        with st.spinner('🤖 AI Models are analyzing your resume... Please wait...'):
+            time.sleep(2)
         
-        # Collecting Miscellaneous Information
-        act_name = st.text_input('Name*')
-        act_mail = st.text_input('Mail*')
-        act_mob  = st.text_input('Mobile Number*')
-        sec_token = secrets.token_urlsafe(12)
-        host_name = socket.gethostname()
-        ip_add = socket.gethostbyname(host_name)
-        dev_user = os.getlogin()
-        os_name_ver = platform.system() + " " + platform.release()
-        g = geocoder.ip('me')
-        latlong = g.latlng
-        geolocator = Nominatim(user_agent="http")
-        location = geolocator.reverse(latlong, language='en')
-        address = location.raw['address']
-        cityy = address.get('city', '')
-        statee = address.get('state', '')
-        countryy = address.get('country', '')  
-        city = cityy
-        state = statee
-        country = countryy
-
-
-        # Upload Resume
-        st.markdown('''<h5 style='text-align: left; color: #021659;'> Upload Your Resume, And Get Smart Recommendations</h5>''',unsafe_allow_html=True)
+        # Save uploaded file temporarily
+        import os
+        os.makedirs('./Uploaded_Resumes', exist_ok=True)
+        save_image_path = './Uploaded_Resumes/' + pdf_file.name
+        with open(save_image_path, "wb") as f:
+            f.write(pdf_file.getbuffer())
         
-        ## file upload in pdf format
-        pdf_file = st.file_uploader("Choose your Resume", type=["pdf"])
-        if pdf_file is not None:
-            with st.spinner('Hang On While We Cook Magic For You...'):
-                time.sleep(4)
-        
-            ### saving the uploaded resume to folder
-            save_image_path = './Uploaded_Resumes/'+pdf_file.name
-            pdf_name = pdf_file.name
-            with open(save_image_path, "wb") as f:
-                f.write(pdf_file.getbuffer())
-            show_pdf(save_image_path)
-
-            ### parsing and extracting whole resume 
-            resume_data = ResumeParser(save_image_path).get_extracted_data()
-            if resume_data:
+        try:
+            # Extract text from PDF
+            resume_text = pdf_reader(save_image_path)
+            
+            # Extract resume data using ML models
+            resume_data = extract_resume_info_ml(resume_text)
+            
+            if resume_data and resume_text:
                 
-                ## Get the whole resume data into resume_text
-                resume_text = pdf_reader(save_image_path)
-
-                ## Showing Analyzed data from (resume_data)
-                st.header("**Resume Analysis 🤘**")
-                st.success("Hello "+ resume_data['name'])
-                st.subheader("**Your Basic info 👀**")
-                try:
-                    st.text('Name: '+resume_data['name'])
-                    st.text('Email: ' + resume_data['email'])
-                    st.text('Contact: ' + resume_data['mobile_number'])
-                    st.text('Degree: '+str(resume_data['degree']))                    
-                    st.text('Resume pages: '+str(resume_data['no_of_pages']))
-
-                except:
-                    pass
-                ## Predicting Candidate Experience Level 
-
-                ### Trying with different possibilities
+                st.markdown("---")
+                st.header("**📊 AI-Powered Resume Analysis**")
+                st.success(f"👋 Hello **{resume_data['name']}**!")
+                
+                # Basic Info Section
+                st.subheader("**👤 Your Basic Information**")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown(f"""
+                    <div class='info-box'>
+                        <strong>📛 Name:</strong> {resume_data['name']}<br>
+                        <strong>📧 Email:</strong> {resume_data['email'] if resume_data['email'] else 'Not found'}<br>
+                        <strong>📱 Contact:</strong> {resume_data['mobile_number'] if resume_data['mobile_number'] else 'Not found'}
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
+                    st.markdown(f"""
+                    <div class='info-box'>
+                        <strong>🎓 Degree:</strong> {resume_data['degree'] if resume_data['degree'] else 'Not found'}<br>
+                        <strong>📄 Resume Pages:</strong> {resume_data['no_of_pages']}<br>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Show extracted organizations and locations
+                if resume_data['organizations'] or resume_data['locations']:
+                    st.subheader("**🏢 ML-Extracted Entities**")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if resume_data['organizations']:
+                            st.info(f"**Organizations:** {', '.join(resume_data['organizations'][:3])}")
+                    
+                    with col2:
+                        if resume_data['locations']:
+                            st.info(f"**Locations:** {', '.join(resume_data['locations'][:3])}")
+                
+                # Experience Level Prediction
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.subheader("**💼 Experience Level**")
+                
                 cand_level = ''
                 if resume_data['no_of_pages'] < 1:                
-                    cand_level = "NA"
-                    st.markdown( '''<h4 style='text-align: left; color: #d73b5c;'>You are at Fresher level!</h4>''',unsafe_allow_html=True)
-                
-                #### if internship then intermediate level
-                elif 'INTERNSHIP' in resume_text:
+                    cand_level = "Fresher"
+                    st.markdown("<div class='level-badge level-fresher'>🌱 Fresher Level</div>", unsafe_allow_html=True)
+                elif 'INTERNSHIP' in resume_text or 'Internship' in resume_text or 'INTERNSHIPS' in resume_text or 'Internships' in resume_text:
                     cand_level = "Intermediate"
-                    st.markdown('''<h4 style='text-align: left; color: #1ed760;'>You are at intermediate level!</h4>''',unsafe_allow_html=True)
-                elif 'INTERNSHIPS' in resume_text:
-                    cand_level = "Intermediate"
-                    st.markdown('''<h4 style='text-align: left; color: #1ed760;'>You are at intermediate level!</h4>''',unsafe_allow_html=True)
-                elif 'Internship' in resume_text:
-                    cand_level = "Intermediate"
-                    st.markdown('''<h4 style='text-align: left; color: #1ed760;'>You are at intermediate level!</h4>''',unsafe_allow_html=True)
-                elif 'Internships' in resume_text:
-                    cand_level = "Intermediate"
-                    st.markdown('''<h4 style='text-align: left; color: #1ed760;'>You are at intermediate level!</h4>''',unsafe_allow_html=True)
-                
-                #### if Work Experience/Experience then Experience level
-                elif 'EXPERIENCE' in resume_text:
+                    st.markdown("<div class='level-badge level-intermediate'>📈 Intermediate Level</div>", unsafe_allow_html=True)
+                elif 'EXPERIENCE' in resume_text or 'Experience' in resume_text or 'WORK EXPERIENCE' in resume_text or 'Work Experience' in resume_text:
                     cand_level = "Experienced"
-                    st.markdown('''<h4 style='text-align: left; color: #fba171;'>You are at experience level!''',unsafe_allow_html=True)
-                elif 'WORK EXPERIENCE' in resume_text:
-                    cand_level = "Experienced"
-                    st.markdown('''<h4 style='text-align: left; color: #fba171;'>You are at experience level!''',unsafe_allow_html=True)
-                elif 'Experience' in resume_text:
-                    cand_level = "Experienced"
-                    st.markdown('''<h4 style='text-align: left; color: #fba171;'>You are at experience level!''',unsafe_allow_html=True)
-                elif 'Work Experience' in resume_text:
-                    cand_level = "Experienced"
-                    st.markdown('''<h4 style='text-align: left; color: #fba171;'>You are at experience level!''',unsafe_allow_html=True)
+                    st.markdown("<div class='level-badge level-experienced'>⭐ Experienced Level</div>", unsafe_allow_html=True)
                 else:
                     cand_level = "Fresher"
-                    st.markdown('''<h4 style='text-align: left; color: #fba171;'>You are at Fresher level!!''',unsafe_allow_html=True)
+                    st.markdown("<div class='level-badge level-fresher'>🌱 Fresher Level</div>", unsafe_allow_html=True)
 
-
-                ## Skills Analyzing and Recommendation
-                st.subheader("**Skills Recommendation 💡**")
+                # ML-Based Career Field Prediction
+                st.markdown("---")
+                st.header("**🤖 AI Career Field Prediction**")
                 
-                ### Current Analyzed Skills
-                keywords = st_tags(label='### Your Current Skills',
-                text='See our skills recommendation below',value=resume_data['skills'],key = '1  ')
-
-                ### Keywords for Recommendations
-                ds_keyword = ['tensorflow','keras','pytorch','machine learning','deep Learning','flask','streamlit']
-                web_keyword = ['react', 'django', 'node jS', 'react js', 'php', 'laravel', 'magento', 'wordpress','javascript', 'angular js', 'C#', 'Asp.net', 'flask']
-                android_keyword = ['android','android development','flutter','kotlin','xml','kivy']
-                ios_keyword = ['ios','ios development','swift','cocoa','cocoa touch','xcode']
-                uiux_keyword = ['ux','adobe xd','figma','zeplin','balsamiq','ui','prototyping','wireframes','storyframes','adobe photoshop','photoshop','editing','adobe illustrator','illustrator','adobe after effects','after effects','adobe premier pro','premier pro','adobe indesign','indesign','wireframe','solid','grasp','user research','user experience']
-                n_any = ['english','communication','writing', 'microsoft office', 'leadership','customer management', 'social media']
-                ### Skill Recommendations Starts                
-                recommended_skills = []
-                reco_field = ''
-                rec_course = ''
-
-                ### condition starts to check skills from keywords and predict field
-                for i in resume_data['skills']:
+                predicted_field, confidence = predict_career_field_ml(resume_text, resume_data['skills'])
                 
-                    #### Data science recommendation
-                    if i.lower() in ds_keyword:
-                        print(i.lower())
-                        reco_field = 'Data Science'
-                        st.success("** Our analysis says you are looking for Data Science Jobs.**")
-                        recommended_skills = ['Data Visualization','Predictive Analysis','Statistical Modeling','Data Mining','Clustering & Classification','Data Analytics','Quantitative Analysis','Web Scraping','ML Algorithms','Keras','Pytorch','Probability','Scikit-learn','Tensorflow',"Flask",'Streamlit']
-                        recommended_keywords = st_tags(label='### Recommended skills for you.',
-                        text='Recommended skills generated from System',value=recommended_skills,key = '2')
-                        st.markdown('''<h5 style='text-align: left; color: #1ed760;'>Adding this skills to resume will boost🚀 the chances of getting a Job</h5>''',unsafe_allow_html=True)
-                        # course recommendation
-                        rec_course = course_recommender(ds_course)
-                        break
+                st.success(f"**🎯 Predicted Career Field:** {predicted_field}")
+                st.info(f"**🎲 Confidence Score:** {confidence:.2%}")
+                
+                # AI Detection Analysis
+                st.markdown("---")
+                st.header("**🔍 AI Content Detection Analysis**")
+                
+                ai_probability, ai_indicators = detect_ai_generated_content(resume_text)
+                
+                # Display AI Detection Results
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.markdown("### 🤖 AI Generation Probability")
+                    
+                    # Color code based on probability
+                    if ai_probability < 0.3:
+                        color = "#28a745"
+                        emoji = "✅"
+                        verdict = "Likely Human-Written"
+                        message = "Your resume shows natural writing patterns with good authenticity."
+                    elif ai_probability < 0.6:
+                        color = "#ffc107"
+                        emoji = "⚠️"
+                        verdict = "Possibly AI-Assisted"
+                        message = "Some sections may have been enhanced with AI tools. Consider adding more personal touches."
+                    else:
+                        color = "#dc3545"
+                        emoji = "🚨"
+                        verdict = "Likely AI-Generated"
+                        message = "Strong indicators of AI-generated content detected. Recruiters prefer authentic, personalized resumes."
+                    
+                    st.markdown(f"""
+                    <div style='background: linear-gradient(135deg, {color} 0%, {color}dd 100%); 
+                                color: white; padding: 1.5rem; border-radius: 15px; text-align: center; 
+                                margin: 1rem 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
+                        <h1 style='margin: 0; font-size: 2.5rem;'>{emoji} {ai_probability*100:.1f}%</h1>
+                        <h3 style='margin: 0.5rem 0 0 0;'>{verdict}</h3>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.info(f"💡 **Analysis:** {message}")
+                
+                with col2:
+                    st.markdown("### 📊 Detection Metrics")
+                    st.metric("Generic Phrases", f"{ai_indicators['generic_phrases']*100:.0f}%")
+                    st.metric("Sentence Uniformity", f"{ai_indicators['sentence_uniformity']*100:.0f}%")
+                    st.metric("Repetitive Patterns", f"{ai_indicators['repetitive_patterns']*100:.0f}%")
+                    st.metric("Buzzword Density", f"{ai_indicators['buzzword_density']*100:.0f}%")
+                
+                # Detailed breakdown
+                with st.expander("📋 View Detailed AI Detection Report"):
+                    st.markdown("#### What We Analyzed:")
+                    st.markdown(f"""
+                    - **Generic Phrases Score:** {ai_indicators['generic_phrases']*100:.1f}% - Checks for overused AI-generated phrases like "results-oriented professional", "proven track record"
+                    - **Sentence Uniformity:** {ai_indicators['sentence_uniformity']*100:.1f}% - AI tends to generate sentences of similar length
+                    - **Repetitive Patterns:** {ai_indicators['repetitive_patterns']*100:.1f}% - Checks if sentences start similarly (AI characteristic)
+                    - **Buzzword Density:** {ai_indicators['buzzword_density']*100:.1f}% - High concentration of business buzzwords
+                    - **Grammar Perfection:** {ai_indicators['perfect_grammar']*100:.1f}% - Unnaturally perfect grammar can indicate AI
+                    """)
+                    
+                    st.markdown("#### 💡 Tips for More Authentic Resumes:")
+                    st.markdown("""
+                    - Use specific examples and numbers from your real experience
+                    - Vary your sentence structure and length naturally
+                    - Replace generic phrases with concrete achievements
+                    - Include personal projects and genuine interests
+                    - Write in your own voice, not corporate buzzwords
+                    - Add unique details that only you can provide
+                    """)
+                
+                # Skills Analysis
+                st.markdown("---")
+                st.header("**💡 ML-Extracted Skills Analysis**")
+                
+                if resume_data['skills']:
+                    st.markdown("### 🎯 Your Current Skills (ML Detected)")
+                    st.info(f"Found **{len(resume_data['skills'])}** technical skills using AI")
+                    keywords = st_tags(
+                        label='',
+                        text='Skills extracted using spaCy NLP',
+                        value=resume_data['skills'],
+                        key='1'
+                    )
+                else:
+                    st.warning("⚠️ No skills detected. Please make sure your resume has a skills section.")
+                    keywords = []
 
-                    #### Web development recommendation
-                    elif i.lower() in web_keyword:
-                        print(i.lower())
-                        reco_field = 'Web Development'
-                        st.success("** Our analysis says you are looking for Web Development Jobs **")
-                        recommended_skills = ['React','Django','Node JS','React JS','php','laravel','Magento','wordpress','Javascript','Angular JS','c#','Flask','SDK']
-                        recommended_keywords = st_tags(label='### Recommended skills for you.',
-                        text='Recommended skills generated from System',value=recommended_skills,key = '3')
-                        st.markdown('''<h5 style='text-align: left; color: #1ed760;'>Adding this skills to resume will boost🚀 the chances of getting a Job💼</h5>''',unsafe_allow_html=True)
-                        # course recommendation
-                        rec_course = course_recommender(web_course)
-                        break
+                # Skill Recommendations based on predicted field
+                st.markdown("### ⭐ Recommended Skills for You")
+                
+                field_recommendations = {
+                    'Data Science': {
+                        'skills': ['Data Visualization', 'Predictive Analysis', 'Statistical Modeling', 'Data Mining', 
+                                   'Clustering & Classification', 'Data Analytics', 'Quantitative Analysis', 'Web Scraping', 
+                                   'ML Algorithms', 'Keras', 'Pytorch', 'Probability', 'Scikit-learn', 'Tensorflow', "Flask", 'Streamlit'],
+                        'courses': ds_course
+                    },
+                    'Web Development': {
+                        'skills': ['React', 'Django', 'Node JS', 'React JS', 'php', 'laravel', 'Magento', 'wordpress', 
+                                   'Javascript', 'Angular JS', 'c#', 'Flask', 'SDK', 'TypeScript', 'Next.js'],
+                        'courses': web_course
+                    },
+                    'Mobile Development': {
+                        'skills': ['Android', 'Android development', 'Flutter', 'Kotlin', 'XML', 'Java', 'Kivy', 'GIT', 
+                                   'SDK', 'SQLite', 'Swift', 'iOS', 'React Native'],
+                        'courses': android_course
+                    },
+                    'UI/UX Design': {
+                        'skills': ['UI', 'User Experience', 'Adobe XD', 'Figma', 'Zeplin', 'Balsamiq', 'Prototyping', 
+                                   'Wireframes', 'Storyframes', 'Adobe Photoshop', 'Editing', 'Illustrator', 'After Effects', 
+                                   'Premier Pro', 'Indesign', 'Wireframe', 'Solid', 'Grasp', 'User Research'],
+                        'courses': uiux_course
+                    },
+                    'DevOps': {
+                        'skills': ['Docker', 'Kubernetes', 'Jenkins', 'CI/CD', 'AWS', 'Azure', 'GCP', 'Terraform', 
+                                   'Ansible', 'GitLab', 'GitHub Actions', 'Monitoring'],
+                        'courses': ds_course  # Using ds_course as placeholder
+                    },
+                    'Data Engineering': {
+                        'skills': ['ETL', 'Apache Airflow', 'Kafka', 'Spark', 'Hadoop', 'Data Pipeline', 'SQL', 
+                                   'NoSQL', 'Data Warehouse', 'Big Data'],
+                        'courses': ds_course  # Using ds_course as placeholder
+                    }
+                }
+                
+                if predicted_field in field_recommendations:
+                    recommended_skills = field_recommendations[predicted_field]['skills']
+                    recommended_keywords = st_tags(
+                        label='',
+                        text=f'AI-recommended skills for {predicted_field}',
+                        value=recommended_skills,
+                        key='2'
+                    )
+                    st.info("💡 **Tip:** Adding these skills to your resume will boost your chances of getting a Job!")
+                    
+                    # Course Recommendations
+                    rec_course = course_recommender(field_recommendations[predicted_field]['courses'])
+                else:
+                    st.info("**ℹ️ General recommendations - AI couldn't confidently predict a specific field.**")
 
-                    #### Android App Development
-                    elif i.lower() in android_keyword:
-                        print(i.lower())
-                        reco_field = 'Android Development'
-                        st.success("** Our analysis says you are looking for Android App Development Jobs **")
-                        recommended_skills = ['Android','Android development','Flutter','Kotlin','XML','Java','Kivy','GIT','SDK','SQLite']
-                        recommended_keywords = st_tags(label='### Recommended skills for you.',
-                        text='Recommended skills generated from System',value=recommended_skills,key = '4')
-                        st.markdown('''<h5 style='text-align: left; color: #1ed760;'>Adding this skills to resume will boost🚀 the chances of getting a Job💼</h5>''',unsafe_allow_html=True)
-                        # course recommendation
-                        rec_course = course_recommender(android_course)
-                        break
-
-                    #### IOS App Development
-                    elif i.lower() in ios_keyword:
-                        print(i.lower())
-                        reco_field = 'IOS Development'
-                        st.success("** Our analysis says you are looking for IOS App Development Jobs **")
-                        recommended_skills = ['IOS','IOS Development','Swift','Cocoa','Cocoa Touch','Xcode','Objective-C','SQLite','Plist','StoreKit',"UI-Kit",'AV Foundation','Auto-Layout']
-                        recommended_keywords = st_tags(label='### Recommended skills for you.',
-                        text='Recommended skills generated from System',value=recommended_skills,key = '5')
-                        st.markdown('''<h5 style='text-align: left; color: #1ed760;'>Adding this skills to resume will boost🚀 the chances of getting a Job💼</h5>''',unsafe_allow_html=True)
-                        # course recommendation
-                        rec_course = course_recommender(ios_course)
-                        break
-
-                    #### Ui-UX Recommendation
-                    elif i.lower() in uiux_keyword:
-                        print(i.lower())
-                        reco_field = 'UI-UX Development'
-                        st.success("** Our analysis says you are looking for UI-UX Development Jobs **")
-                        recommended_skills = ['UI','User Experience','Adobe XD','Figma','Zeplin','Balsamiq','Prototyping','Wireframes','Storyframes','Adobe Photoshop','Editing','Illustrator','After Effects','Premier Pro','Indesign','Wireframe','Solid','Grasp','User Research']
-                        recommended_keywords = st_tags(label='### Recommended skills for you.',
-                        text='Recommended skills generated from System',value=recommended_skills,key = '6')
-                        st.markdown('''<h5 style='text-align: left; color: #1ed760;'>Adding this skills to resume will boost🚀 the chances of getting a Job💼</h5>''',unsafe_allow_html=True)
-                        # course recommendation
-                        rec_course = course_recommender(uiux_course)
-                        break
-
-                    #### For Not Any Recommendations
-                    elif i.lower() in n_any:
-                        print(i.lower())
-                        reco_field = 'NA'
-                        st.warning("** Currently our tool only predicts and recommends for Data Science, Web, Android, IOS and UI/UX Development**")
-                        recommended_skills = ['No Recommendations']
-                        recommended_keywords = st_tags(label='### Recommended skills for you.',
-                        text='Currently No Recommendations',value=recommended_skills,key = '6')
-                        st.markdown('''<h5 style='text-align: left; color: #092851;'>Maybe Available in Future Updates</h5>''',unsafe_allow_html=True)
-                        # course recommendation
-                        rec_course = "Sorry! Not Available for this Field"
-                        break
-
-
-                ## Resume Scorer & Resume Writing Tips
-                st.subheader("**Resume Tips & Ideas 🥂**")
+                # Resume Scoring
+                st.markdown("---")
+                st.header("**✨ Resume Content Analysis**")
                 resume_score = 0
                 
-                ### Predicting Whether these key points are added to the resume
-                if 'Objective' or 'Summary' in resume_text:
-                    resume_score = resume_score+6
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Objective/Summary</h4>''',unsafe_allow_html=True)                
+                # Check for key sections
+                if 'Objective' in resume_text or 'Summary' in resume_text or 'OBJECTIVE' in resume_text or 'SUMMARY' in resume_text:
+                    resume_score += 6
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added Objective/Summary</div>", unsafe_allow_html=True)                
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add your career objective, it will give your career intension to the Recruiters.</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add your career objective - it will give your career intention to the Recruiters</div>", unsafe_allow_html=True)
 
-                if 'Education' or 'School' or 'College'  in resume_text:
-                    resume_score = resume_score + 12
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Education Details</h4>''',unsafe_allow_html=True)
+                if 'Education' in resume_text or 'EDUCATION' in resume_text or 'School' in resume_text or 'College' in resume_text or 'University' in resume_text:
+                    resume_score += 12
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added Education Details</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Education. It will give Your Qualification level to the recruiter</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Education - it will show your qualification level to the recruiter</div>", unsafe_allow_html=True)
 
-                if 'EXPERIENCE' in resume_text:
-                    resume_score = resume_score + 16
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Experience</h4>''',unsafe_allow_html=True)
-                elif 'Experience' in resume_text:
-                    resume_score = resume_score + 16
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Experience</h4>''',unsafe_allow_html=True)
+                if 'EXPERIENCE' in resume_text or 'Experience' in resume_text:
+                    resume_score += 16
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added Experience</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Experience. It will help you to stand out from crowd</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Experience - it will help you stand out from the crowd</div>", unsafe_allow_html=True)
 
-                if 'INTERNSHIPS'  in resume_text:
-                    resume_score = resume_score + 6
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Internships</h4>''',unsafe_allow_html=True)
-                elif 'INTERNSHIP'  in resume_text:
-                    resume_score = resume_score + 6
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Internships</h4>''',unsafe_allow_html=True)
-                elif 'Internships'  in resume_text:
-                    resume_score = resume_score + 6
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Internships</h4>''',unsafe_allow_html=True)
-                elif 'Internship'  in resume_text:
-                    resume_score = resume_score + 6
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Internships</h4>''',unsafe_allow_html=True)
+                if 'INTERNSHIP' in resume_text or 'Internship' in resume_text or 'INTERNSHIPS' in resume_text or 'Internships' in resume_text:
+                    resume_score += 6
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added Internships</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Internships. It will help you to stand out from crowd</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Internships - it will help you stand out from the crowd</div>", unsafe_allow_html=True)
 
-                if 'SKILLS'  in resume_text:
-                    resume_score = resume_score + 7
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Skills</h4>''',unsafe_allow_html=True)
-                elif 'SKILL'  in resume_text:
-                    resume_score = resume_score + 7
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Skills</h4>''',unsafe_allow_html=True)
-                elif 'Skills'  in resume_text:
-                    resume_score = resume_score + 7
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Skills</h4>''',unsafe_allow_html=True)
-                elif 'Skill'  in resume_text:
-                    resume_score = resume_score + 7
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added Skills</h4>''',unsafe_allow_html=True)
+                if 'SKILLS' in resume_text or 'SKILL' in resume_text or 'Skills' in resume_text or 'Skill' in resume_text:
+                    resume_score += 7
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added Skills</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Skills. It will help you a lot</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Skills section - it will help you a lot</div>", unsafe_allow_html=True)
 
-                if 'HOBBIES' in resume_text:
-                    resume_score = resume_score + 4
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Hobbies</h4>''',unsafe_allow_html=True)
-                elif 'Hobbies' in resume_text:
-                    resume_score = resume_score + 4
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Hobbies</h4>''',unsafe_allow_html=True)
+                if 'HOBBIES' in resume_text or 'Hobbies' in resume_text:
+                    resume_score += 4
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added your Hobbies</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Hobbies. It will show your personality to the Recruiters and give the assurance that you are fit for this role or not.</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Hobbies - it will show your personality to the Recruiters</div>", unsafe_allow_html=True)
 
-                if 'INTERESTS'in resume_text:
-                    resume_score = resume_score + 5
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Interest</h4>''',unsafe_allow_html=True)
-                elif 'Interests'in resume_text:
-                    resume_score = resume_score + 5
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Interest</h4>''',unsafe_allow_html=True)
+                if 'INTERESTS' in resume_text or 'Interests' in resume_text:
+                    resume_score += 5
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added your Interests</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Interest. It will show your interest other that job.</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Interests - it will show your interests other than job</div>", unsafe_allow_html=True)
 
-                if 'ACHIEVEMENTS' in resume_text:
-                    resume_score = resume_score + 13
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Achievements </h4>''',unsafe_allow_html=True)
-                elif 'Achievements' in resume_text:
-                    resume_score = resume_score + 13
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Achievements </h4>''',unsafe_allow_html=True)
+                if 'ACHIEVEMENTS' in resume_text or 'Achievements' in resume_text:
+                    resume_score += 13
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added your Achievements</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Achievements. It will show that you are capable for the required position.</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Achievements - it shows you are capable for the position</div>", unsafe_allow_html=True)
 
-                if 'CERTIFICATIONS' in resume_text:
-                    resume_score = resume_score + 12
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Certifications </h4>''',unsafe_allow_html=True)
-                elif 'Certifications' in resume_text:
-                    resume_score = resume_score + 12
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Certifications </h4>''',unsafe_allow_html=True)
-                elif 'Certification' in resume_text:
-                    resume_score = resume_score + 12
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Certifications </h4>''',unsafe_allow_html=True)
+                if 'CERTIFICATIONS' in resume_text or 'Certifications' in resume_text or 'Certification' in resume_text:
+                    resume_score += 12
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added your Certifications</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Certifications. It will show that you have done some specialization for the required position.</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Certifications - it shows you have specialization</div>", unsafe_allow_html=True)
 
-                if 'PROJECTS' in resume_text:
-                    resume_score = resume_score + 19
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Projects</h4>''',unsafe_allow_html=True)
-                elif 'PROJECT' in resume_text:
-                    resume_score = resume_score + 19
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Projects</h4>''',unsafe_allow_html=True)
-                elif 'Projects' in resume_text:
-                    resume_score = resume_score + 19
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Projects</h4>''',unsafe_allow_html=True)
-                elif 'Project' in resume_text:
-                    resume_score = resume_score + 19
-                    st.markdown('''<h5 style='text-align: left; color: #1ed760;'>[+] Awesome! You have added your Projects</h4>''',unsafe_allow_html=True)
+                if 'PROJECTS' in resume_text or 'PROJECT' in resume_text or 'Projects' in resume_text or 'Project' in resume_text:
+                    resume_score += 19
+                    st.markdown("<div class='success-item'>✅ <strong>Awesome!</strong> You have added your Projects</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown('''<h5 style='text-align: left; color: #000000;'>[-] Please add Projects. It will show that you have done work related the required position or not.</h4>''',unsafe_allow_html=True)
+                    st.markdown("<div class='warning-item'>⚠️ <strong>Suggestion:</strong> Add Projects - it shows relevant work experience</div>", unsafe_allow_html=True)
 
-                st.subheader("**Resume Score 📝**")
+                # Display Resume Score
+                st.markdown("---")
+                st.header("**📊 Your Resume Score**")
                 
-                st.markdown(
-                    """
-                    <style>
-                        .stProgress > div > div > div > div {
-                            background-color: #d73b5c;
-                        }
-                    </style>""",
-                    unsafe_allow_html=True,
-                )
-
-                ### Score Bar
+                # Score Bar
                 my_bar = st.progress(0)
-                score = 0
                 for percent_complete in range(resume_score):
-                    score +=1
-                    time.sleep(0.1)
+                    time.sleep(0.01)
                     my_bar.progress(percent_complete + 1)
+                
+                # Display Score with color coding
+                if resume_score >= 80:
+                    score_color = "#28a745"
+                    score_emoji = "🌟"
+                    score_text = "Excellent!"
+                elif resume_score >= 60:
+                    score_color = "#ffc107"
+                    score_emoji = "👍"
+                    score_text = "Good!"
+                else:
+                    score_color = "#dc3545"
+                    score_emoji = "📈"
+                    score_text = "Needs Improvement"
+                
+                st.markdown(f"""
+                <div style='background: linear-gradient(135deg, {score_color} 0%, {score_color}dd 100%); 
+                            color: white; padding: 2rem; border-radius: 15px; text-align: center; 
+                            margin: 1rem 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
+                    <h1 style='margin: 0; font-size: 3rem;'>{score_emoji} {resume_score}/100</h1>
+                    <h3 style='margin: 0.5rem 0 0 0;'>{score_text}</h3>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.info("💡 **Note:** This score is calculated based on the content in your Resume. ML models analyzed structure and completeness.")
 
-                ### Score
-                st.success('** Your Resume Writing Score: ' + str(score)+'**')
-                st.warning("** Note: This score is calculated based on the content that you have in your Resume. **")
-
-                # print(str(sec_token), str(ip_add), (host_name), (dev_user), (os_name_ver), (latlong), (city), (state), (country), (act_name), (act_mail), (act_mob), resume_data['name'], resume_data['email'], str(resume_score), timestamp, str(resume_data['no_of_pages']), reco_field, cand_level, str(resume_data['skills']), str(recommended_skills), str(rec_course), pdf_name)
-
-
-                ### Getting Current Date and Time
-                ts = time.time()
-                cur_date = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-                cur_time = datetime.datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-                timestamp = str(cur_date+'_'+cur_time)
-
-
-                ## Calling insert_data to add all the data into user_data                
-                insert_data(str(sec_token), str(ip_add), (host_name), (dev_user), (os_name_ver), (latlong), (city), (state), (country), (act_name), (act_mail), (act_mob), resume_data['name'], resume_data['email'], str(resume_score), timestamp, str(resume_data['no_of_pages']), reco_field, cand_level, str(resume_data['skills']), str(recommended_skills), str(rec_course), pdf_name)
-
-                ## Recommending Resume Writing Video
-                st.header("**Bonus Video for Resume Writing Tips💡**")
+                # Recommending Resume Writing Video
+                st.markdown("---")
+                st.header("**🎥 Bonus: Resume Writing Tips**")
                 resume_vid = random.choice(resume_videos)
                 st.video(resume_vid)
 
-                ## Recommending Interview Preparation Video
-                st.header("**Bonus Video for Interview Tips💡**")
+                # Recommending Interview Preparation Video
+                st.header("**🎥 Bonus: Interview Preparation Tips**")
                 interview_vid = random.choice(interview_videos)
                 st.video(interview_vid)
 
-                ## On Successful Result 
-                st.balloons()
+                # Success message
+                st.success("✅ Analysis Complete!")
 
             else:
-                st.error('Something went wrong..')                
-
-
-    ###### CODE FOR FEEDBACK SIDE ######
-    elif choice == 'Feedback':   
-        
-        # timestamp 
-        ts = time.time()
-        cur_date = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-        cur_time = datetime.datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-        timestamp = str(cur_date+'_'+cur_time)
-
-        # Feedback Form
-        with st.form("my_form"):
-            st.write("Feedback form")            
-            feed_name = st.text_input('Name')
-            feed_email = st.text_input('Email')
-            feed_score = st.slider('Rate Us From 1 - 5', 1, 5)
-            comments = st.text_input('Comments')
-            Timestamp = timestamp        
-            submitted = st.form_submit_button("Submit")
-            if submitted:
-                ## Calling insertf_data to add dat into user feedback
-                insertf_data(feed_name,feed_email,feed_score,comments,Timestamp)    
-                ## Success Message 
-                st.success("Thanks! Your Feedback was recorded.") 
-                ## On Successful Submit
-                st.balloons()    
-
-
-        # query to fetch data from user feedback table
-        query = 'select * from user_feedback'        
-        plotfeed_data = pd.read_sql(query, connection)                        
-
-
-        # fetching feed_score from the query and getting the unique values and total value count 
-        labels = plotfeed_data.feed_score.unique()
-        values = plotfeed_data.feed_score.value_counts()
-
-
-        # plotting pie chart for user ratings
-        st.subheader("**Past User Rating's**")
-        fig = px.pie(values=values, names=labels, title="Chart of User Rating Score From 1 - 5", color_discrete_sequence=px.colors.sequential.Aggrnyl)
-        st.plotly_chart(fig)
-
-
-        #  Fetching Comment History
-        cursor.execute('select feed_name, comments from user_feedback')
-        plfeed_cmt_data = cursor.fetchall()
-
-        st.subheader("**User Comment's**")
-        dff = pd.DataFrame(plfeed_cmt_data, columns=['User', 'Comment'])
-        st.dataframe(dff, width=1000)
-
-    
-    ###### CODE FOR ABOUT PAGE ######
-    elif choice == 'About':   
-
-        st.subheader("**About The Tool - AI RESUME ANALYZER**")
-
-        st.markdown('''
-
-        <p align='justify'>
-            A tool which parses information from a resume using natural language processing and finds the keywords, cluster them onto sectors based on their keywords. And lastly show recommendations, predictions, analytics to the applicant based on keyword matching.
-        </p>
-
-        <p align="justify">
-            <b>How to use it: -</b> <br/><br/>
-            <b>User -</b> <br/>
-            In the Side Bar choose yourself as user and fill the required fields and upload your resume in pdf format.<br/>
-            Just sit back and relax our tool will do the magic on it's own.<br/><br/>
-            <b>Feedback -</b> <br/>
-            A place where user can suggest some feedback about the tool.<br/><br/>
-            <b>Admin -</b> <br/>
-            For login use <b>admin</b> as username and <b>admin@resume-analyzer</b> as password.<br/>
-            It will load all the required stuffs and perform analysis.
-        </p><br/><br/>
-
-        <p align="justify">
-            Built with 🤍 by 
-            <a href="https://dnoobnerd.netlify.app/" style="text-decoration: none; color: grey;">Deepak Padhi</a> through 
-            <a href="https://www.linkedin.com/in/mrbriit/" style="text-decoration: none; color: grey;">Dr Bright --(Data Scientist)</a>
-        </p>
-
-        ''',unsafe_allow_html=True)  
-
-
-    ###### CODE FOR ADMIN SIDE (ADMIN) ######
-    else:
-        st.success('Welcome to Admin Side')
-
-        #  Admin Login
-        ad_user = st.text_input("Username")
-        ad_password = st.text_input("Password", type='password')
-
-        if st.button('Login'):
-            
-            ## Credentials 
-            if ad_user == 'admin' and ad_password == 'admin@resume-analyzer':
+                st.error('❌ Could not extract text from the PDF. Please make sure you uploaded a valid PDF resume.')
                 
-                ### Fetch miscellaneous data from user_data(table) and convert it into dataframe
-                cursor.execute('''SELECT ID, ip_add, resume_score, convert(Predicted_Field using utf8), convert(User_level using utf8), city, state, country from user_data''')
-                datanalys = cursor.fetchall()
-                plot_data = pd.DataFrame(datanalys, columns=['Idt', 'IP_add', 'resume_score', 'Predicted_Field', 'User_Level', 'City', 'State', 'Country'])
-                
-                ### Total Users Count with a Welcome Message
-                values = plot_data.Idt.count()
-                st.success("Welcome Deepak ! Total %d " % values + " User's Have Used Our Tool : )")                
-                
-                ### Fetch user data from user_data(table) and convert it into dataframe
-                cursor.execute('''SELECT ID, sec_token, ip_add, act_name, act_mail, act_mob, convert(Predicted_Field using utf8), Timestamp, Name, Email_ID, resume_score, Page_no, pdf_name, convert(User_level using utf8), convert(Actual_skills using utf8), convert(Recommended_skills using utf8), convert(Recommended_courses using utf8), city, state, country, latlong, os_name_ver, host_name, dev_user from user_data''')
-                data = cursor.fetchall()                
+        except Exception as e:
+            st.error(f'❌ Error processing resume: {str(e)}')
+            st.info('Please make sure you uploaded a valid PDF file with text content.')
+            st.info('If you see spaCy errors, run: `python -m spacy download en_core_web_sm`')
 
-                st.header("**User's Data**")
-                df = pd.DataFrame(data, columns=['ID', 'Token', 'IP Address', 'Name', 'Mail', 'Mobile Number', 'Predicted Field', 'Timestamp',
-                                                 'Predicted Name', 'Predicted Mail', 'Resume Score', 'Total Page',  'File Name',   
-                                                 'User Level', 'Actual Skills', 'Recommended Skills', 'Recommended Course',
-                                                 'City', 'State', 'Country', 'Lat Long', 'Server OS', 'Server Name', 'Server User',])
-                
-                ### Viewing the dataframe
-                st.dataframe(df)
-                
-                ### Downloading Report of user_data in csv file
-                st.markdown(get_csv_download_link(df,'User_Data.csv','Download Report'), unsafe_allow_html=True)
 
-                ### Fetch feedback data from user_feedback(table) and convert it into dataframe
-                cursor.execute('''SELECT * from user_feedback''')
-                data = cursor.fetchall()
-
-                st.header("**User's Feedback Data**")
-                df = pd.DataFrame(data, columns=['ID', 'Name', 'Email', 'Feedback Score', 'Comments', 'Timestamp'])
-                st.dataframe(df)
-
-                ### query to fetch data from user_feedback(table)
-                query = 'select * from user_feedback'
-                plotfeed_data = pd.read_sql(query, connection)                        
-
-                ### Analyzing All the Data's in pie charts
-
-                # fetching feed_score from the query and getting the unique values and total value count 
-                labels = plotfeed_data.feed_score.unique()
-                values = plotfeed_data.feed_score.value_counts()
-                
-                # Pie chart for user ratings
-                st.subheader("**User Rating's**")
-                fig = px.pie(values=values, names=labels, title="Chart of User Rating Score From 1 - 5 🤗", color_discrete_sequence=px.colors.sequential.Aggrnyl)
-                st.plotly_chart(fig)
-
-                # fetching Predicted_Field from the query and getting the unique values and total value count                 
-                labels = plot_data.Predicted_Field.unique()
-                values = plot_data.Predicted_Field.value_counts()
-
-                # Pie chart for predicted field recommendations
-                st.subheader("**Pie-Chart for Predicted Field Recommendation**")
-                fig = px.pie(df, values=values, names=labels, title='Predicted Field according to the Skills 👽', color_discrete_sequence=px.colors.sequential.Aggrnyl_r)
-                st.plotly_chart(fig)
-
-                # fetching User_Level from the query and getting the unique values and total value count                 
-                labels = plot_data.User_Level.unique()
-                values = plot_data.User_Level.value_counts()
-
-                # Pie chart for User's👨‍💻 Experienced Level
-                st.subheader("**Pie-Chart for User's Experienced Level**")
-                fig = px.pie(df, values=values, names=labels, title="Pie-Chart 📈 for User's 👨‍💻 Experienced Level", color_discrete_sequence=px.colors.sequential.RdBu)
-                st.plotly_chart(fig)
-
-                # fetching resume_score from the query and getting the unique values and total value count                 
-                labels = plot_data.resume_score.unique()                
-                values = plot_data.resume_score.value_counts()
-
-                # Pie chart for Resume Score
-                st.subheader("**Pie-Chart for Resume Score**")
-                fig = px.pie(df, values=values, names=labels, title='From 1 to 100 💯', color_discrete_sequence=px.colors.sequential.Agsunset)
-                st.plotly_chart(fig)
-
-                # fetching IP_add from the query and getting the unique values and total value count 
-                labels = plot_data.IP_add.unique()
-                values = plot_data.IP_add.value_counts()
-
-                # Pie chart for Users
-                st.subheader("**Pie-Chart for Users App Used Count**")
-                fig = px.pie(df, values=values, names=labels, title='Usage Based On IP Address 👥', color_discrete_sequence=px.colors.sequential.matter_r)
-                st.plotly_chart(fig)
-
-                # fetching City from the query and getting the unique values and total value count 
-                labels = plot_data.City.unique()
-                values = plot_data.City.value_counts()
-
-                # Pie chart for City
-                st.subheader("**Pie-Chart for City**")
-                fig = px.pie(df, values=values, names=labels, title='Usage Based On City 🌆', color_discrete_sequence=px.colors.sequential.Jet)
-                st.plotly_chart(fig)
-
-                # fetching State from the query and getting the unique values and total value count 
-                labels = plot_data.State.unique()
-                values = plot_data.State.value_counts()
-
-                # Pie chart for State
-                st.subheader("**Pie-Chart for State**")
-                fig = px.pie(df, values=values, names=labels, title='Usage Based on State 🚉', color_discrete_sequence=px.colors.sequential.PuBu_r)
-                st.plotly_chart(fig)
-
-                # fetching Country from the query and getting the unique values and total value count 
-                labels = plot_data.Country.unique()
-                values = plot_data.Country.value_counts()
-
-                # Pie chart for Country
-                st.subheader("**Pie-Chart for Country**")
-                fig = px.pie(df, values=values, names=labels, title='Usage Based on Country 🌏', color_discrete_sequence=px.colors.sequential.Purpor_r)
-                st.plotly_chart(fig)
-
-            ## For Wrong Credentials
-            else:
-                st.error("Wrong ID & Password Provided")
-
-# Calling the main (run()) function to make the whole process run
-run()
+# Run the application
+if __name__ == '__main__':
+    run()
